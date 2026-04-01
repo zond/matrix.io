@@ -57,6 +57,7 @@ impl TerritoryRing {
 // ---------------------------------------------------------------------------
 
 struct RemotePlayer {
+    /// Last authoritative position from server
     position: Position,
     angle: f64,
     color: [u8; 3],
@@ -68,6 +69,9 @@ struct RemotePlayer {
     has_crown: bool,
     boost_points: u8,
     boost_active: bool,
+    /// Smoothed display position (what we actually render)
+    display_x: f64,
+    display_y: f64,
 }
 
 impl RemotePlayer {
@@ -84,7 +88,35 @@ impl RemotePlayer {
             has_crown: false,
             boost_points: 0,
             boost_active: false,
+            display_x: pos.x,
+            display_y: pos.y,
         }
+    }
+
+    /// Effective speed (base + boost)
+    fn effective_speed(&self) -> f64 {
+        if self.boost_active { PLAYER_SPEED * 1.5 } else { PLAYER_SPEED }
+    }
+
+    /// Compute predicted position based on server state + elapsed time
+    fn predicted(&self, now: f64) -> (f64, f64) {
+        if self.angle.is_nan() {
+            return (self.position.x, self.position.y);
+        }
+        let dt = ((now - self.server_time) / 1000.0).clamp(0.0, 0.2);
+        let spd = self.effective_speed();
+        (
+            self.position.x + self.angle.cos() * spd * dt,
+            self.position.y + self.angle.sin() * spd * dt,
+        )
+    }
+
+    /// Smoothly move display position toward predicted position
+    fn update_display(&mut self, now: f64) {
+        let (tx, ty) = self.predicted(now);
+        // Lerp factor: 0.3 per frame → ~95% correction in 5 frames (~80ms)
+        self.display_x += (tx - self.display_x) * 0.3;
+        self.display_y += (ty - self.display_y) * 0.3;
     }
 }
 
@@ -857,6 +889,18 @@ fn send_angle(s: &mut GameState, angle: f64) {
         }
         s.last_direction_sent = now;
     }
+    // Local prediction: immediately apply angle to local player so movement
+    // starts before the server confirms (eliminates input lag)
+    if let Some(my_id) = s.player_id {
+        if let Some(me) = s.players.get_mut(&my_id) {
+            // Update server_time + position to "now" so prediction doesn't jump
+            let now = now_ms();
+            let (px, py) = me.predicted(now);
+            me.position = Position { x: px, y: py };
+            me.server_time = now;
+            me.angle = angle;
+        }
+    }
     send_angle_raw(&s.ws, angle);
 }
 
@@ -1125,6 +1169,11 @@ fn start_render_loop(state: Rc<RefCell<GameState>>, _: &Window) {
 fn render(s: &mut GameState, _ts: f64) {
     let now = now_ms();
 
+    // Smooth all player display positions toward their predicted positions
+    for rp in s.players.values_mut() {
+        rp.update_display(now);
+    }
+
     // Pre-cache sprite images and territory patterns (needs &mut s)
     {
         let needed: Vec<u32> = s
@@ -1168,7 +1217,7 @@ fn render(s: &mut GameState, _ts: f64) {
     }
 
     let (cam_x, cam_y) = match s.player_id.and_then(|id| s.players.get(&id)) {
-        Some(me) => extrap(me, now),
+        Some(me) => (me.display_x, me.display_y),
         None => (0.0, 0.0),
     };
 
@@ -1288,8 +1337,7 @@ fn render(s: &mut GameState, _ts: f64) {
         .players
         .iter()
         .map(|(&id, rp)| {
-            let (px, py) = extrap(rp, now);
-            (px, py, rp.angle, rp.sprite_id, rp.has_crown, Some(id) == s.player_id)
+            (rp.display_x, rp.display_y, rp.angle, rp.sprite_id, rp.has_crown, Some(id) == s.player_id)
         })
         .collect();
 
@@ -1299,12 +1347,6 @@ fn render(s: &mut GameState, _ts: f64) {
         let r = cs * 0.4;
         let sprite_size = r * 8.0;
 
-        // Drop shadow for player sprite/circle
-        ctx.set_shadow_color(if shadows_enabled { "rgba(0,0,0,0.6)" } else { "transparent" });
-        ctx.set_shadow_offset_x(shadow_offset);
-        ctx.set_shadow_offset_y(shadow_offset);
-        ctx.set_shadow_blur(shadow_blur);
-
         // Look up cached color strings by sprite_id → player
         let (color_fill, color_trail) = s
             .players
@@ -1313,8 +1355,25 @@ fn render(s: &mut GameState, _ts: f64) {
             .map(|rp| (rp.color_fill.as_str(), rp.color_trail.as_str()))
             .unwrap_or(("gray", "gray"));
 
+        ctx.set_shadow_color("transparent");
+
         let drew_sprite = if let Some(img) = s.sprite_images.get(&sprite_id) {
             if img.complete() && img.natural_width() > 0 {
+                // Shadow: draw sprite as black silhouette at offset
+                if shadows_enabled {
+                    ctx.save();
+                    ctx.set_global_alpha(0.4);
+                    ctx.set_filter("brightness(0)");
+                    let _ = ctx.draw_image_with_html_image_element_and_dw_and_dh(
+                        img,
+                        sx - sprite_size / 2.0 + shadow_offset,
+                        sy - sprite_size / 2.0 + shadow_offset,
+                        sprite_size,
+                        sprite_size,
+                    );
+                    ctx.restore();
+                }
+                // Real sprite on top
                 let _ = ctx.draw_image_with_html_image_element_and_dw_and_dh(
                     img,
                     sx - sprite_size / 2.0,
@@ -1337,8 +1396,7 @@ fn render(s: &mut GameState, _ts: f64) {
             ctx.fill();
         }
 
-        // Clear shadow for indicator and crown
-        ctx.set_shadow_color("transparent");
+
 
         // Direction indicator
         if !angle.is_nan() {
@@ -1459,15 +1517,6 @@ fn centered_text(ctx: &CanvasRenderingContext2d, w: f64, h: f64, text: &str) {
     ctx.set_text_align("center");
     ctx.set_text_baseline("middle");
     let _ = ctx.fill_text(text, w / 2.0, h / 2.0);
-}
-
-fn extrap(p: &RemotePlayer, now: f64) -> (f64, f64) {
-    if p.angle.is_nan() { return (p.position.x, p.position.y); }
-    let dt = ((now - p.server_time) / 1000.0).min(0.15);
-    (
-        p.position.x + p.angle.cos() * PLAYER_SPEED * dt,
-        p.position.y + p.angle.sin() * PLAYER_SPEED * dt,
-    )
 }
 
 fn now_ms() -> f64 {

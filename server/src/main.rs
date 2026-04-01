@@ -312,11 +312,8 @@ impl Game {
                 self.next_id += 1;
                 let color = COLORS[(id as usize) % COLORS.len()];
                 let position = self.find_spawn_position();
-                let territory = rect_polygon(
-                    position.x - STARTING_TERRITORY_RADIUS,
-                    position.y - STARTING_TERRITORY_RADIUS,
-                    position.x + STARTING_TERRITORY_RADIUS,
-                    position.y + STARTING_TERRITORY_RADIUS,
+                let territory = circle_polygon(
+                    position.x, position.y, STARTING_TERRITORY_RADIUS, 24,
                 );
                 let spawn_multi = geo::MultiPolygon::new(vec![territory.clone()]);
 
@@ -682,8 +679,19 @@ impl Game {
             self.capture_territory(id);
         }
 
+        // Deduplicate kills: each player dies at most once, and if you're
+        // the killer you shouldn't also be killed in the same tick
         let mut killed = HashSet::new();
+        let mut killers = HashSet::new();
+        for &(_victim, killer) in &kills {
+            if let Some(kid) = killer {
+                killers.insert(kid);
+            }
+        }
         for (victim, killer) in kills {
+            if killed.contains(&victim) || killers.contains(&victim) {
+                continue; // already dead, or is a killer this tick (priority)
+            }
             if killed.insert(victim) {
                 self.kill_player(victim, killer);
             }
@@ -1123,6 +1131,16 @@ impl Game {
             let _ = p.tx.send(encode_server_msg(msg));
         }
     }
+}
+
+fn circle_polygon(cx: f64, cy: f64, radius: f64, segments: usize) -> geo::Polygon<f64> {
+    let pts: Vec<(f64, f64)> = (0..=segments)
+        .map(|i| {
+            let a = std::f64::consts::TAU * i as f64 / segments as f64;
+            (cx + radius * a.cos(), cy + radius * a.sin())
+        })
+        .collect();
+    geo::Polygon::new(geo::LineString::from(pts), vec![])
 }
 
 fn rect_polygon(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> geo::Polygon<f64> {
