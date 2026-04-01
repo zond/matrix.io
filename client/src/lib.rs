@@ -21,6 +21,7 @@ macro_rules! log {
 struct TerritoryRing {
     color: [u8; 3],
     color_str: String,
+    sprite_id: u32,
     points: Vec<Position>,
     min_x: f64,
     min_y: f64,
@@ -41,6 +42,7 @@ impl TerritoryRing {
         TerritoryRing {
             color_str: format!("rgba({},{},{},0.35)", d.color[0], d.color[1], d.color[2]),
             color: d.color,
+            sprite_id: d.sprite_id,
             points: d.points,
             min_x: mnx,
             min_y: mny,
@@ -989,27 +991,16 @@ fn render(s: &mut GameState, _ts: f64) {
         for sid in needed {
             get_sprite_image(s, sid);
         }
-        // Pre-cache territory patterns for visible rings
+        // Pre-cache territory patterns for visible rings (uses sprite_id from territory data)
         let ring_keys: Vec<(u32, [u8; 3])> = s
             .territory
             .iter()
-            .filter_map(|ring| {
-                let sprite_id = s
-                    .players
-                    .values()
-                    .find(|rp| {
-                        // Match player by color (player_id isn't in tick data for other players' territories)
-                        rp.color == ring.color
-                    })
-                    .map(|rp| rp.sprite_id)?;
-                if s.territory_patterns.contains_key(&(sprite_id, ring.color)) {
-                    None
-                } else {
-                    Some((sprite_id, ring.color))
-                }
-            })
+            .filter(|ring| !s.territory_patterns.contains_key(&(ring.sprite_id, ring.color)))
+            .map(|ring| (ring.sprite_id, ring.color))
             .collect();
         for (sid, color) in ring_keys {
+            // Ensure the sprite image is loaded first
+            get_sprite_image(s, sid);
             get_territory_pattern(s, sid, color);
         }
     }
@@ -1074,17 +1065,8 @@ fn render(s: &mut GameState, _ts: f64) {
         }
         for indices in s.territory_groups.values() {
             if indices.is_empty() { continue; }
-            let color = s.territory[indices[0]].color;
-
-            // Try to find a pattern for this color's player
-            let sprite_id = s
-                .players
-                .values()
-                .find(|rp| rp.color == color)
-                .map(|rp| rp.sprite_id);
-            let pattern = sprite_id.and_then(|sid| {
-                s.territory_patterns.get(&(sid, color)).cloned()
-            });
+            let ring = &s.territory[indices[0]];
+            let pattern = s.territory_patterns.get(&(ring.sprite_id, ring.color)).cloned();
 
             // Set fill: pattern if available, solid color fallback
             if let Some(pat) = pattern {

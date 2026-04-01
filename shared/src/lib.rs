@@ -5,7 +5,7 @@ pub mod protocol_capnp {
 pub type PlayerId = u64;
 
 pub const PLAYER_SPEED: f64 = 10.0;
-pub const VISIBILITY_RADIUS: f64 = 40.0;
+pub const VISIBILITY_RADIUS: f64 = 250.0;
 pub const STARTING_TERRITORY_RADIUS: f64 = 2.5;
 pub const CELL_SIZE: f64 = 30.0;
 pub const KILL_DISTANCE: f64 = 0.15;
@@ -38,6 +38,7 @@ pub struct TerritoryRingData {
     pub player_id: PlayerId,
     pub color: [u8; 3],
     pub points: Vec<Position>,
+    pub sprite_id: u32,
 }
 
 pub struct LeaderboardEntryData {
@@ -131,6 +132,7 @@ pub fn encode_server_msg(msg: &ServerMsg) -> Vec<u8> {
                 for (i, ring) in rings.iter().enumerate() {
                     let mut rb = list.reborrow().get(i as u32);
                     rb.set_player_id(ring.player_id);
+                    rb.set_sprite_id(ring.sprite_id);
                     let mut col = rb.reborrow().init_color();
                     col.set_r(ring.color[0]);
                     col.set_g(ring.color[1]);
@@ -274,6 +276,7 @@ pub fn decode_server_msg(bytes: &[u8]) -> capnp::Result<ServerMsg> {
                     player_id: ring.get_player_id(),
                     color: [col.get_r(), col.get_g(), col.get_b()],
                     points,
+                    sprite_id: ring.get_sprite_id(),
                 });
             }
             Ok(ServerMsg::TerritorySnapshot(rings))

@@ -25,6 +25,7 @@ struct TerritoryRing {
     playerId @0 :UInt64;
     color @1 :Color;
     points @2 :List(Position);
+    spriteId @3 :UInt32;
 }
 
 struct LeaderboardEntry {

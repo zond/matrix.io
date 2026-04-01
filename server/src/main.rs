@@ -9,8 +9,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use geo::{
-    Area, BooleanOps, BoundingRect, Contains, ConvexHull, Distance, Euclidean, Intersects,
-    Simplify,
+    Area, BooleanOps, BoundingRect, Contains, ConvexHull, Intersects, Simplify,
 };
 use rand::Rng;
 use shared::*;
@@ -35,7 +34,7 @@ const COLORS: [[u8; 3]; 12] = [
 ];
 
 /// Cell size for the spatial hash: 2x VISIBILITY_RADIUS.
-const SPATIAL_CELL_SIZE: f64 = 80.0;
+const SPATIAL_CELL_SIZE: f64 = 500.0;
 
 /// Simplification tolerance applied after polygon union/difference.
 const SIMPLIFY_EPSILON: f64 = 0.3;
@@ -383,9 +382,16 @@ impl Game {
                     if let Some(p) = self.players.get_mut(&player_id) {
                         if p.alive {
                             // Record trail corner before turning (if trail active)
+                            // Only if moved enough from last point to avoid wobbly false crossings
                             if !p.in_territory && !p.trail.is_empty() && !p.angle.is_nan() {
-                                p.trail.push(p.position);
-                                p.update_trail_aabb();
+                                let last = p.trail[p.trail.len() - 1];
+                                let dx = p.position.x - last.x;
+                                let dy = p.position.y - last.y;
+                                if dx * dx + dy * dy > 0.25 {
+                                    // > 0.5 units from last point
+                                    p.trail.push(p.position);
+                                    p.update_trail_aabb();
+                                }
                             }
                             p.angle = angle;
                         }
@@ -506,7 +512,6 @@ impl Game {
             }
             let px = p.position.x;
             let py = p.position.y;
-            let pt = geo::Point::new(px, py);
 
             // Check own trail: did the movement segment cross any earlier trail segment?
             // Skip the last 2 trail segments (adjacent to current position).
@@ -528,29 +533,49 @@ impl Game {
                 }
             }
 
-            // Check other players' trails using pre-computed LineStrings
-            for &oid in &ids {
-                if oid == id {
-                    continue;
-                }
-
-                let line = match trail_lines.get(&oid) {
-                    Some(l) => l,
-                    None => continue,
-                };
-
-                if let Some(&(min_x, min_y, max_x, max_y)) = trail_aabbs.get(&oid) {
-                    if px < min_x - KILL_DISTANCE
-                        || px > max_x + KILL_DISTANCE
-                        || py < min_y - KILL_DISTANCE
-                        || py > max_y + KILL_DISTANCE
-                    {
+            // Check if movement segment crosses any other player's trail
+            if let Some(&old_pos) = old_positions.get(&id) {
+                let new_pos = p.position;
+                for &oid in &ids {
+                    if oid == id {
                         continue;
                     }
-                }
+                    let other = match self.players.get(&oid) {
+                        Some(o) if o.alive && o.trail.len() >= 2 => o,
+                        _ => continue,
+                    };
 
-                if Euclidean::distance(&pt, line) < KILL_DISTANCE {
-                    kills.push((oid, Some(id)));
+                    // AABB pre-check
+                    if let Some(&(min_x, min_y, max_x, max_y)) = trail_aabbs.get(&oid) {
+                        let mx = px.min(old_pos.x);
+                        let my = py.min(old_pos.y);
+                        let xx = px.max(old_pos.x);
+                        let xy = py.max(old_pos.y);
+                        if xx < min_x || mx > max_x || xy < min_y || my > max_y {
+                            continue;
+                        }
+                    }
+
+                    // Check movement segment against all trail segments + live endpoint
+                    let trail = &other.trail;
+                    let mut crossed = false;
+                    for i in 0..trail.len() - 1 {
+                        if segments_cross(old_pos, new_pos, trail[i], trail[i + 1]) {
+                            crossed = true;
+                            break;
+                        }
+                    }
+                    // Also check last trail point → current position (live segment)
+                    if !crossed {
+                        if let Some(&last) = trail.last() {
+                            if segments_cross(old_pos, new_pos, last, other.position) {
+                                crossed = true;
+                            }
+                        }
+                    }
+                    if crossed {
+                        kills.push((oid, Some(id)));
+                    }
                 }
             }
         }
@@ -946,6 +971,7 @@ impl Game {
                     player_id: p.id,
                     color: p.color,
                     points,
+                    sprite_id: p.sprite_id,
                 });
             }
         }
