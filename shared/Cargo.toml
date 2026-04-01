@@ -1,0 +1,10 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+capnp = "0.20"
+
+[build-dependencies]
+capnpc = "0.20"
