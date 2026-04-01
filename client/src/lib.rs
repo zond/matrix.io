@@ -40,7 +40,7 @@ impl TerritoryRing {
             mxy = mxy.max(p.y);
         }
         TerritoryRing {
-            color_str: format!("rgba({},{},{},0.35)", d.color[0], d.color[1], d.color[2]),
+            color_str: format!("rgb({},{},{})", d.color[0], d.color[1], d.color[2]),
             color: d.color,
             sprite_id: d.sprite_id,
             points: d.points,
@@ -66,6 +66,8 @@ struct RemotePlayer {
     server_time: f64,
     sprite_id: u32,
     has_crown: bool,
+    boost_points: u8,
+    boost_active: bool,
 }
 
 impl RemotePlayer {
@@ -80,6 +82,8 @@ impl RemotePlayer {
             server_time: now,
             sprite_id,
             has_crown: false,
+            boost_points: 0,
+            boost_active: false,
         }
     }
 }
@@ -127,6 +131,14 @@ struct GameState {
     territory_groups: HashMap<[u8; 3], Vec<usize>>,
     /// Cached territory tile patterns: (sprite_id, color) → CanvasPattern
     territory_patterns: HashMap<(u32, [u8; 3]), web_sys::CanvasPattern>,
+    /// Boost display element
+    boost_div: HtmlElement,
+    /// Current board radius from server
+    board_radius: f64,
+    /// Minimap canvas (held to keep DOM element alive)
+    #[allow(dead_code)]
+    minimap: HtmlCanvasElement,
+    minimap_ctx: CanvasRenderingContext2d,
 }
 
 // ---------------------------------------------------------------------------
@@ -153,8 +165,9 @@ pub fn start() {
     canvas.set_width(width as u32);
     canvas.set_height(height as u32);
 
-    let lb_area = create_leaderboard(&document, "left");
-    let lb_kills = create_leaderboard_bottom(&document);
+    let (lb_area, lb_kills) = create_leaderboards(&document);
+    let boost_div = create_boost_display(&document);
+    let (minimap, minimap_ctx) = create_minimap(&document);
 
     // Load name from localStorage
     let my_name = web_sys::window()
@@ -191,6 +204,10 @@ pub fn start() {
         lb_kills,
         territory_groups: HashMap::new(),
         territory_patterns: HashMap::new(),
+        boost_div,
+        board_radius: 50.0,
+        minimap,
+        minimap_ctx,
     }));
 
     setup_resize(state.clone(), &window);
@@ -199,6 +216,7 @@ pub fn start() {
     setup_mouse(state.clone(), &window);
     setup_wheel(state.clone(), &window);
     create_hamburger_menu(state.clone(), &document);
+    setup_boost_clicks(state.clone());
     load_sprites(state.clone());
     start_render_loop(state, &window);
 }
@@ -229,43 +247,84 @@ fn create_canvas(document: &Document) -> HtmlCanvasElement {
 // Leaderboards
 // ---------------------------------------------------------------------------
 
-fn create_leaderboard(document: &Document, side: &str) -> HtmlElement {
-    let div = document.create_element("div").unwrap().dyn_into::<HtmlElement>().unwrap();
-    let s = div.style();
-    s.set_property("position", "fixed").unwrap();
-    s.set_property("top", "12px").unwrap();
-    s.set_property(side, "12px").unwrap();
-    s.set_property("background", "rgba(0,0,0,0.5)").unwrap();
-    s.set_property("color", "white").unwrap();
-    s.set_property("padding", "8px 12px").unwrap();
-    s.set_property("border-radius", "6px").unwrap();
-    s.set_property("font-family", "monospace").unwrap();
-    s.set_property("font-size", "12px").unwrap();
-    s.set_property("z-index", "50").unwrap();
-    s.set_property("pointer-events", "none").unwrap();
-    s.set_property("min-width", "120px").unwrap();
-    s.set_property("white-space", "pre").unwrap();
-    document.body().unwrap().append_child(&div).unwrap();
-    div
+fn create_leaderboards(document: &Document) -> (HtmlElement, HtmlElement) {
+    // Container for both lists, stacked vertically
+    let container = document.create_element("div").unwrap().dyn_into::<HtmlElement>().unwrap();
+    let cs = container.style();
+    cs.set_property("position", "fixed").unwrap();
+    cs.set_property("top", "12px").unwrap();
+    cs.set_property("left", "12px").unwrap();
+    cs.set_property("z-index", "50").unwrap();
+    cs.set_property("pointer-events", "none").unwrap();
+
+    let make_panel = |doc: &Document| -> HtmlElement {
+        let div = doc.create_element("div").unwrap().dyn_into::<HtmlElement>().unwrap();
+        let s = div.style();
+        s.set_property("background", "rgba(0,0,0,0.5)").unwrap();
+        s.set_property("color", "white").unwrap();
+        s.set_property("padding", "8px 12px").unwrap();
+        s.set_property("border-radius", "6px").unwrap();
+        s.set_property("font-family", "monospace").unwrap();
+        s.set_property("font-size", "12px").unwrap();
+        s.set_property("min-width", "120px").unwrap();
+        s.set_property("white-space", "pre").unwrap();
+        s.set_property("margin-bottom", "6px").unwrap();
+        div
+    };
+
+    let lb_area = make_panel(document);
+    let lb_kills = make_panel(document);
+
+    container.append_child(&lb_area).unwrap();
+    container.append_child(&lb_kills).unwrap();
+    document.body().unwrap().append_child(&container).unwrap();
+
+    (lb_area, lb_kills)
 }
 
-fn create_leaderboard_bottom(document: &Document) -> HtmlElement {
+fn create_minimap(document: &Document) -> (HtmlCanvasElement, CanvasRenderingContext2d) {
+    let size = 150u32;
+    let canvas = document.create_element("canvas").unwrap().dyn_into::<HtmlCanvasElement>().unwrap();
+    canvas.set_width(size);
+    canvas.set_height(size);
+    let s = canvas.style();
+    s.set_property("position", "fixed").unwrap();
+    s.set_property("bottom", "12px").unwrap();
+    s.set_property("left", "12px").unwrap();
+    s.set_property("width", &format!("{}px", size)).unwrap();
+    s.set_property("height", &format!("{}px", size)).unwrap();
+    s.set_property("border-radius", "50%").unwrap();
+    s.set_property("z-index", "50").unwrap();
+    s.set_property("pointer-events", "none").unwrap();
+    s.set_property("opacity", "0.4").unwrap();
+    document.body().unwrap().append_child(&canvas).unwrap();
+    let ctx = canvas.get_context("2d").unwrap().unwrap().dyn_into::<CanvasRenderingContext2d>().unwrap();
+    (canvas, ctx)
+}
+
+fn create_boost_display(document: &Document) -> HtmlElement {
     let div = document.create_element("div").unwrap().dyn_into::<HtmlElement>().unwrap();
     let s = div.style();
     s.set_property("position", "fixed").unwrap();
     s.set_property("bottom", "12px").unwrap();
-    s.set_property("left", "12px").unwrap();
-    s.set_property("background", "rgba(0,0,0,0.5)").unwrap();
-    s.set_property("color", "white").unwrap();
-    s.set_property("padding", "8px 12px").unwrap();
-    s.set_property("border-radius", "6px").unwrap();
-    s.set_property("font-family", "monospace").unwrap();
-    s.set_property("font-size", "12px").unwrap();
-    s.set_property("z-index", "50").unwrap();
-    s.set_property("pointer-events", "none").unwrap();
-    s.set_property("min-width", "120px").unwrap();
-    s.set_property("white-space", "pre").unwrap();
+    s.set_property("right", "12px").unwrap();
+    s.set_property("font-size", "36px").unwrap();
+    s.set_property("z-index", "60").unwrap();
+    s.set_property("cursor", "pointer").unwrap();
+    s.set_property("user-select", "none").unwrap();
+    s.set_property("touch-action", "auto").unwrap();
     document.body().unwrap().append_child(&div).unwrap();
+
+    // Stop touch events from reaching the game
+    let el: web_sys::EventTarget = div.clone().into();
+    for evt in &["touchstart", "touchmove", "touchend"] {
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            e.stop_propagation();
+        });
+        el.add_event_listener_with_callback(evt, cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
     div
 }
 
@@ -516,12 +575,12 @@ fn get_territory_pattern(
         .ok()?;
 
     // Fill with semi-transparent player color
-    octx.set_global_alpha(0.15);
+    octx.set_global_alpha(1.0);
     octx.set_fill_style_str(&format!("rgb({},{},{})", color[0], color[1], color[2]));
     octx.fill_rect(0.0, 0.0, tile_size as f64, tile_size as f64);
 
-    // Draw sprite on top, semi-transparent grayscale effect
-    octx.set_global_alpha(0.12);
+    // Draw sprite on top, lighter overlay
+    octx.set_global_alpha(0.2);
     let _ = octx.draw_image_with_html_image_element_and_dw_and_dh(
         img,
         2.0,
@@ -797,6 +856,44 @@ fn send_name(ws: &Option<WebSocket>, name: &str) {
     }
 }
 
+fn send_boost(ws: &Option<WebSocket>) {
+    if let Some(ws) = ws {
+        let bytes = encode_client_msg(&ClientMsg::ActivateBoost);
+        let arr = js_sys::Uint8Array::from(bytes.as_slice());
+        let _ = ws.send_with_array_buffer_view(&arr);
+    }
+}
+
+fn setup_boost_clicks(state: Rc<RefCell<GameState>>) {
+    let s = state.borrow();
+    let div = s.boost_div.clone();
+    drop(s);
+
+    // Use mousedown (not click) so it works while already holding the mouse
+    {
+        let state = state.clone();
+        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+            e.stop_propagation();
+            e.prevent_default();
+            send_boost(&state.borrow().ws);
+        });
+        div.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref())
+            .unwrap();
+        cb.forget();
+    }
+    // Also handle touchstart for mobile (in addition to the stopPropagation already set)
+    {
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            e.stop_propagation();
+            e.prevent_default();
+            send_boost(&state.borrow().ws);
+        });
+        div.add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref())
+            .unwrap();
+        cb.forget();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket
 // ---------------------------------------------------------------------------
@@ -889,7 +986,8 @@ fn handle_msg(state: &Rc<RefCell<GameState>>, bytes: &[u8]) {
             let sid = s.my_sprite_id;
             s.players.insert(player_id, RemotePlayer::new(position, angle, color, sid, now));
         }
-        ServerMsg::Tick(players) => {
+        ServerMsg::Tick { players, board_radius } => {
+            s.board_radius = board_radius;
             s.last_tick_time = now;
             let ids: std::collections::HashSet<PlayerId> = players.iter().map(|p| p.id).collect();
             for ps in players {
@@ -902,6 +1000,8 @@ fn handle_msg(state: &Rc<RefCell<GameState>>, bytes: &[u8]) {
                 e.server_time = now;
                 e.sprite_id = ps.sprite_id;
                 e.has_crown = ps.has_crown;
+                e.boost_points = ps.boost_points;
+                e.boost_active = ps.boost_active;
                 if e.color != ps.color {
                     e.color = ps.color;
                     e.color_fill = format!("rgb({},{},{})", ps.color[0], ps.color[1], ps.color[2]);
@@ -910,6 +1010,17 @@ fn handle_msg(state: &Rc<RefCell<GameState>>, bytes: &[u8]) {
             }
             if let Some(my) = s.player_id {
                 s.players.retain(|id, _| ids.contains(id) || *id == my);
+                // Update boost display for local player
+                if let Some(me) = s.players.get(&my) {
+                    let mut html = String::new();
+                    for _ in 0..me.boost_points {
+                        html.push_str("\u{26A1}");
+                    }
+                    if me.boost_active {
+                        html.push_str(" \u{1F525}"); // fire = boost active
+                    }
+                    s.boost_div.set_inner_html(&html);
+                }
             }
         }
         ServerMsg::TerritorySnapshot(rings) => {
@@ -1052,7 +1163,39 @@ fn render(s: &mut GameState, _ts: f64) {
         ctx.stroke();
     }
 
-    // Territory — batch by color, AABB cull, pattern fill with sprite texture
+    // Board boundary — dark void outside, thick black circle edge
+    {
+        let bcx = to_sx(0.0);
+        let bcy = to_sy(0.0);
+        let br = s.board_radius * cs;
+
+        // Draw dark overlay outside the circle using clip inversion
+        ctx.save();
+        ctx.begin_path();
+        ctx.rect(0.0, 0.0, w, h);
+        // Cut out the circle (counterclockwise = hole in the rect)
+        let _ = ctx.arc_with_anticlockwise(bcx, bcy, br, 0.0, TAU, true);
+        ctx.set_fill_style_str("rgba(0,0,0,0.7)");
+        ctx.fill();
+        ctx.restore();
+
+        // Thick black border ring
+        ctx.set_stroke_style_str("black");
+        ctx.set_line_width((4.0 * s.zoom).max(2.0));
+        ctx.begin_path();
+        let _ = ctx.arc(bcx, bcy, br, 0.0, TAU);
+        ctx.stroke();
+    }
+
+    // Drop shadow settings
+    let shadow_offset = (6.0 * s.zoom).max(2.0);
+    let shadow_blur = (1.0 * s.zoom).max(0.5);
+
+    // Territory — batch by color, AABB cull, pattern fill with drop shadow
+    ctx.set_shadow_color("rgba(0,0,0,0.55)");
+    ctx.set_shadow_offset_x(shadow_offset);
+    ctx.set_shadow_offset_y(shadow_offset);
+    ctx.set_shadow_blur(shadow_blur);
     {
         for v in s.territory_groups.values_mut() {
             v.clear();
@@ -1068,7 +1211,6 @@ fn render(s: &mut GameState, _ts: f64) {
             let ring = &s.territory[indices[0]];
             let pattern = s.territory_patterns.get(&(ring.sprite_id, ring.color)).cloned();
 
-            // Set fill: pattern if available, solid color fallback
             if let Some(pat) = pattern {
                 ctx.set_fill_style_canvas_pattern(&pat);
             } else {
@@ -1086,7 +1228,11 @@ fn render(s: &mut GameState, _ts: f64) {
         }
     }
 
-    // Trails
+    // Trails — with drop shadow
+    ctx.set_shadow_color("rgba(0,0,0,0.5)");
+    ctx.set_shadow_offset_x(shadow_offset * 0.8);
+    ctx.set_shadow_offset_y(shadow_offset * 0.8);
+    ctx.set_shadow_blur(shadow_blur * 0.8);
     for rp in s.players.values() {
         if rp.trail.len() < 2 { continue; }
         ctx.set_stroke_style_str(&rp.color_trail);
@@ -1098,6 +1244,9 @@ fn render(s: &mut GameState, _ts: f64) {
         for p in &rp.trail[1..] { ctx.line_to(to_sx(p.x), to_sy(p.y)); }
         ctx.stroke();
     }
+
+    // Reset shadow before players (players set their own)
+    ctx.set_shadow_color("transparent");
 
     // Players — collect lightweight render data (no String cloning)
     let player_render: Vec<(f64, f64, f64, u32, bool, bool)> = s
@@ -1114,6 +1263,12 @@ fn render(s: &mut GameState, _ts: f64) {
         let sy = to_sy(py);
         let r = cs * 0.4;
         let sprite_size = r * 8.0;
+
+        // Drop shadow for player sprite/circle
+        ctx.set_shadow_color("rgba(0,0,0,0.6)");
+        ctx.set_shadow_offset_x(shadow_offset);
+        ctx.set_shadow_offset_y(shadow_offset);
+        ctx.set_shadow_blur(shadow_blur);
 
         // Look up cached color strings by sprite_id → player
         let (color_fill, color_trail) = s
@@ -1147,6 +1302,9 @@ fn render(s: &mut GameState, _ts: f64) {
             ctx.fill();
         }
 
+        // Clear shadow for indicator and crown
+        ctx.set_shadow_color("transparent");
+
         // Direction indicator
         if !angle.is_nan() {
             let len = r * 1.6;
@@ -1168,6 +1326,86 @@ fn render(s: &mut GameState, _ts: f64) {
             let _ = ctx.fill_text("\u{1F451}", sx, sy - sprite_size * 0.4);
         }
     }
+
+    // Coordinates display (bottom center)
+    ctx.set_font("12px monospace");
+    ctx.set_fill_style_str("rgba(0,0,0,0.5)");
+    ctx.set_text_align("center");
+    ctx.set_text_baseline("bottom");
+    let _ = ctx.fill_text(
+        &format!("{:.0}, {:.0}", cam_x, cam_y),
+        w / 2.0,
+        h - 8.0,
+    );
+
+    // Minimap
+    render_minimap(s, cam_x, cam_y, cs);
+}
+
+fn render_minimap(s: &GameState, cam_x: f64, cam_y: f64, cs: f64) {
+    let mc = &s.minimap_ctx;
+    let size = 150.0;
+    let br = s.board_radius;
+    if br <= 0.0 {
+        return;
+    }
+    let scale = (size * 0.45) / br; // map board radius to ~45% of minimap size
+    let cx = size / 2.0;
+    let cy = size / 2.0;
+
+    let to_mx = |wx: f64| cx + wx * scale;
+    let to_my = |wy: f64| cy + wy * scale;
+
+    // Clear
+    mc.clear_rect(0.0, 0.0, size, size);
+
+    // Board circle background
+    mc.set_fill_style_str("rgba(255,255,255,0.8)");
+    mc.begin_path();
+    let _ = mc.arc(cx, cy, br * scale, 0.0, TAU);
+    mc.fill();
+
+    // Board border
+    mc.set_stroke_style_str("black");
+    mc.set_line_width(1.5);
+    mc.begin_path();
+    let _ = mc.arc(cx, cy, br * scale, 0.0, TAU);
+    mc.stroke();
+
+    // Territory polygons (filled, no detail needed)
+    for ring in &s.territory {
+        if ring.points.len() < 3 {
+            continue;
+        }
+        mc.set_fill_style_str(&ring.color_str);
+        mc.begin_path();
+        mc.move_to(to_mx(ring.points[0].x), to_my(ring.points[0].y));
+        for p in &ring.points[1..] {
+            mc.line_to(to_mx(p.x), to_my(p.y));
+        }
+        mc.close_path();
+        mc.fill();
+    }
+
+    // Player dots
+    for rp in s.players.values() {
+        mc.set_fill_style_str(&rp.color_fill);
+        mc.begin_path();
+        let _ = mc.arc(to_mx(rp.position.x), to_my(rp.position.y), 2.5, 0.0, TAU);
+        mc.fill();
+    }
+
+    // Viewport rectangle
+    let vw = s.width / cs; // viewport size in world units
+    let vh = s.height / cs;
+    mc.set_stroke_style_str("rgba(0,0,0,0.6)");
+    mc.set_line_width(1.0);
+    mc.stroke_rect(
+        to_mx(cam_x - vw / 2.0),
+        to_my(cam_y - vh / 2.0),
+        vw * scale,
+        vh * scale,
+    );
 }
 
 fn centered_text(ctx: &CanvasRenderingContext2d, w: f64, h: f64, text: &str) {

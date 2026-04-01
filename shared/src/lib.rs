@@ -4,7 +4,7 @@ pub mod protocol_capnp {
 
 pub type PlayerId = u64;
 
-pub const PLAYER_SPEED: f64 = 10.0;
+pub const PLAYER_SPEED: f64 = 12.5;
 pub const VISIBILITY_RADIUS: f64 = 250.0;
 pub const STARTING_TERRITORY_RADIUS: f64 = 2.5;
 pub const CELL_SIZE: f64 = 30.0;
@@ -32,6 +32,8 @@ pub struct PlayerStateData {
     pub trail: Vec<Position>,
     pub sprite_id: u32,
     pub has_crown: bool,
+    pub boost_points: u8,
+    pub boost_active: bool,
 }
 
 pub struct TerritoryRingData {
@@ -57,6 +59,7 @@ pub enum ClientMsg {
     Ping(f64),
     SetSprite(u32),
     SetName(String),
+    ActivateBoost,
 }
 
 pub enum ServerMsg {
@@ -66,7 +69,10 @@ pub enum ServerMsg {
         angle: f64,
         color: [u8; 3],
     },
-    Tick(Vec<PlayerStateData>),
+    Tick {
+        players: Vec<PlayerStateData>,
+        board_radius: f64,
+    },
     TerritorySnapshot(Vec<TerritoryRingData>),
     PlayerKilled {
         player_id: PlayerId,
@@ -102,8 +108,9 @@ pub fn encode_server_msg(msg: &ServerMsg) -> Vec<u8> {
                 col.set_g(color[1]);
                 col.set_b(color[2]);
             }
-            ServerMsg::Tick(players) => {
-                let t = root.init_tick();
+            ServerMsg::Tick { ref players, board_radius } => {
+                let mut t = root.init_tick();
+                t.set_board_radius(*board_radius);
                 let mut list = t.init_players(players.len() as u32);
                 for (i, p) in players.iter().enumerate() {
                     let mut pb = list.reborrow().get(i as u32);
@@ -118,6 +125,8 @@ pub fn encode_server_msg(msg: &ServerMsg) -> Vec<u8> {
                     col.set_b(p.color[2]);
                     pb.set_sprite_id(p.sprite_id);
                     pb.set_has_crown(p.has_crown);
+                    pb.set_boost_points(p.boost_points);
+                    pb.set_boost_active(p.boost_active);
                     let mut trail = pb.init_trail(p.trail.len() as u32);
                     for (j, t) in p.trail.iter().enumerate() {
                         let mut tb = trail.reborrow().get(j as u32);
@@ -196,6 +205,9 @@ pub fn encode_client_msg(msg: &ClientMsg) -> Vec<u8> {
             ClientMsg::SetName(ref name) => {
                 root.set_set_name(name);
             }
+            ClientMsg::ActivateBoost => {
+                root.set_activate_boost(());
+            }
         }
     }
     let mut output = Vec::new();
@@ -254,9 +266,12 @@ pub fn decode_server_msg(bytes: &[u8]) -> capnp::Result<ServerMsg> {
                     trail,
                     sprite_id: p.get_sprite_id(),
                     has_crown: p.get_has_crown(),
+                    boost_points: p.get_boost_points(),
+                    boost_active: p.get_boost_active(),
                 });
             }
-            Ok(ServerMsg::Tick(players))
+            let board_radius = t.get_board_radius();
+            Ok(ServerMsg::Tick { players, board_radius })
         }
         Which::TerritorySnapshot(r) => {
             let ts = r?;
@@ -328,5 +343,6 @@ pub fn decode_client_msg(bytes: &[u8]) -> capnp::Result<ClientMsg> {
         Which::Ping(ts) => Ok(ClientMsg::Ping(ts)),
         Which::SetSprite(id) => Ok(ClientMsg::SetSprite(id)),
         Which::SetName(name) => Ok(ClientMsg::SetName(name?.to_string()?)),
+        Which::ActivateBoost(()) => Ok(ClientMsg::ActivateBoost),
     }
 }

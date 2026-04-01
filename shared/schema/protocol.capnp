@@ -19,6 +19,8 @@ struct PlayerState {
     trail @4 :List(Position);
     spriteId @5 :UInt32;
     hasCrown @6 :Bool;
+    boostPoints @7 :UInt8;
+    boostActive @8 :Bool;
 }
 
 struct TerritoryRing {
@@ -42,6 +44,7 @@ struct ClientMessage {
     union {
         changeDirection @0 :Float64;
         ping @1 :Float64;
+        activateBoost @4 :Void;
         setSprite @2 :UInt32;
         setName @3 :Text;
     }
@@ -67,6 +70,7 @@ struct Welcome {
 
 struct Tick {
     players @0 :List(PlayerState);
+    boardRadius @1 :Float64;
 }
 
 struct TerritorySnapshot {

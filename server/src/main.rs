@@ -78,6 +78,8 @@ struct Player {
     sprite_id: u32,
     name: String,
     kill_count: u32,
+    boost_points: u8,
+    boost_until: Option<std::time::Instant>,
     /// Last territory version this player was sent.
     last_territory_version: u64,
 }
@@ -168,6 +170,10 @@ struct Game {
     spatial_hash: SpatialHash,
     /// Monotonic version counter incremented on any territory change.
     territory_version: u64,
+    /// Current board radius (smoothly interpolated).
+    board_radius: f64,
+    /// Target board radius based on player count.
+    target_board_radius: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +290,8 @@ impl Game {
             tick_count: 0,
             spatial_hash: SpatialHash::new(SPATIAL_CELL_SIZE),
             territory_version: 0,
+            board_radius: 50.0,
+            target_board_radius: 50.0,
         }
     }
 
@@ -310,6 +318,18 @@ impl Game {
                     position.x + STARTING_TERRITORY_RADIUS,
                     position.y + STARTING_TERRITORY_RADIUS,
                 );
+                let spawn_multi = geo::MultiPolygon::new(vec![territory.clone()]);
+
+                // Steal this area from any existing players
+                for other in self.players.values_mut() {
+                    if let Ok(diff) = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| {
+                            other.territory.difference(&spawn_multi)
+                        }),
+                    ) {
+                        other.territory = diff.simplify(&SIMPLIFY_EPSILON);
+                    }
+                }
 
                 self.territory_version += 1;
                 self.players.insert(
@@ -328,6 +348,8 @@ impl Game {
                         sprite_id: 0,
                         name: format!("Player {}", id),
                         kill_count: 0,
+                        boost_points: 0,
+                        boost_until: None,
                         last_territory_version: 0,
                     },
                 );
@@ -407,7 +429,16 @@ impl Game {
                 }
                 ClientMsg::SetName(name) => {
                     if let Some(p) = self.players.get_mut(&player_id) {
-                        p.name = name.chars().take(20).collect(); // cap at 20 chars
+                        p.name = name.chars().take(20).collect();
+                    }
+                }
+                ClientMsg::ActivateBoost => {
+                    if let Some(p) = self.players.get_mut(&player_id) {
+                        if p.boost_points > 0 {
+                            p.boost_points -= 1;
+                            p.boost_until =
+                                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                        }
                     }
                 }
             },
@@ -417,10 +448,68 @@ impl Game {
     fn update(&mut self, dt: f64) {
         self.tick_count += 1;
 
+        // Update board radius: 30 * sqrt(player_count), min 50
+        let alive = self.players.values().filter(|p| p.alive).count().max(1);
+        self.target_board_radius = (30.0 * (alive as f64).sqrt()).max(50.0);
+        self.board_radius += (self.target_board_radius - self.board_radius) * 0.02;
+
         // Rebuild spatial hash at the start of each tick
         self.rebuild_spatial_hash();
 
         let ids: Vec<PlayerId> = self.players.keys().copied().collect();
+
+        // Compute speed multipliers: +2.2% per player ranked below you on either list
+        let speed_mult: HashMap<PlayerId, f64> = {
+            let alive_count = self.players.values().filter(|p| p.alive).count();
+            if alive_count <= 1 {
+                ids.iter().map(|&id| (id, 1.0)).collect()
+            } else {
+                // Rank by area (descending)
+                let mut by_area: Vec<(PlayerId, f64)> = self
+                    .players
+                    .values()
+                    .filter(|p| p.alive)
+                    .map(|p| (p.id, p.territory.unsigned_area()))
+                    .collect();
+                by_area.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+
+                // Rank by kills (descending)
+                let mut by_kills: Vec<(PlayerId, u32)> = self
+                    .players
+                    .values()
+                    .filter(|p| p.alive)
+                    .map(|p| (p.id, p.kill_count))
+                    .collect();
+                by_kills.sort_by(|a, b| b.1.cmp(&a.1));
+
+                let area_rank: HashMap<PlayerId, usize> = by_area
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (id, _))| (*id, i))
+                    .collect();
+                let kill_rank: HashMap<PlayerId, usize> = by_kills
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (id, _))| (*id, i))
+                    .collect();
+
+                let n = alive_count;
+                ids.iter()
+                    .map(|&id| {
+                        let ar = area_rank.get(&id).copied().unwrap_or(n - 1);
+                        let kr = kill_rank.get(&id).copied().unwrap_or(n - 1);
+                        // Players below you = (n-1) - rank for each list
+                        let below_area = (n - 1).saturating_sub(ar);
+                        let below_kills = (n - 1).saturating_sub(kr);
+                        // Count unique players below you on either list
+                        let below_total = below_area + below_kills;
+                        // 1.022^below_total — multiplicative per player below
+                        let mult = 1.022_f64.powi(below_total as i32);
+                        (id, mult)
+                    })
+                    .collect()
+            }
+        };
 
         // Move players, track old positions for boundary crossing & self-kill
         let mut old_positions: HashMap<PlayerId, Position> = HashMap::new();
@@ -429,9 +518,18 @@ impl Game {
                 Some(p) if p.alive && !p.angle.is_nan() => p,
                 _ => continue,
             };
+            let mut mult = speed_mult.get(&id).copied().unwrap_or(1.0);
+            // Active boost: +50% speed
+            if let Some(until) = p.boost_until {
+                if std::time::Instant::now() < until {
+                    mult *= 1.5;
+                } else {
+                    p.boost_until = None;
+                }
+            }
             old_positions.insert(id, p.position);
-            p.position.x += p.angle.cos() * PLAYER_SPEED * dt;
-            p.position.y += p.angle.sin() * PLAYER_SPEED * dt;
+            p.position.x += p.angle.cos() * PLAYER_SPEED * mult * dt;
+            p.position.y += p.angle.sin() * PLAYER_SPEED * mult * dt;
             if !p.in_territory && !p.trail.is_empty() {
                 p.update_trail_aabb();
             }
@@ -590,6 +688,19 @@ impl Game {
                 self.kill_player(victim, killer);
             }
         }
+
+        // Clamp players to inside the board boundary (slide along edge)
+        let br = self.board_radius;
+        for p in self.players.values_mut() {
+            if !p.alive {
+                continue;
+            }
+            let dist = (p.position.x * p.position.x + p.position.y * p.position.y).sqrt();
+            if dist > br && dist > 0.0 {
+                p.position.x = p.position.x / dist * br;
+                p.position.y = p.position.y / dist * br;
+            }
+        }
     }
 
     // -- capture -----------------------------------------------------------
@@ -699,10 +810,13 @@ impl Game {
             Some(p) => p.position,
             None => return,
         };
-        // Credit the killer
+        // Credit the killer with a kill and a boost point (max 3)
         if let Some(kid) = killer_id {
             if let Some(killer) = self.players.get_mut(&kid) {
                 killer.kill_count += 1;
+                if killer.boost_points < 3 {
+                    killer.boost_points += 1;
+                }
             }
         }
         let msg = ServerMsg::PlayerKilled {
@@ -769,9 +883,14 @@ impl Game {
         let search = ((max_x - min_x + max_y - min_y) / 2.0 + 20.0).max(20.0);
         let r = STARTING_TERRITORY_RADIUS;
 
+        let max_r = self.board_radius - r - 1.0;
+        // Try to find a clear spot first
         for _ in 0..200 {
             let x = cx + rng.gen_range(-search..=search);
             let y = cy + rng.gen_range(-search..=search);
+            if x * x + y * y > max_r * max_r {
+                continue;
+            }
             let spawn = rect_polygon(x - r, y - r, x + r, y + r);
             let clear = self
                 .players
@@ -782,9 +901,12 @@ impl Game {
             }
         }
 
+        // Fallback: random position inside the board (will steal territory on spawn)
+        let angle = rng.gen_range(0.0..std::f64::consts::TAU);
+        let dist = rng.gen_range(0.0..(max_r * 0.8));
         Position {
-            x: max_x + 10.0,
-            y: (min_y + max_y) / 2.0,
+            x: angle.cos() * dist,
+            y: angle.sin() * dist,
         }
     }
 
@@ -801,11 +923,16 @@ impl Game {
             .map(|p| (p.id, p.territory.unsigned_area()))
             .collect();
 
-        // Determine crown holder (largest territory by area) using cached areas
-        let crown_holder: Option<PlayerId> = area_map
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(&id, _)| id);
+        // Crown holder = #1 on the area list (same sort: area desc, then lowest ID)
+        let crown_holder: Option<PlayerId> = {
+            let mut sorted: Vec<_> = area_map.iter().collect();
+            sorted.sort_by(|a, b| {
+                b.1.partial_cmp(a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(b.0))
+            });
+            sorted.first().map(|(&id, _)| id)
+        };
 
         let viewers: Vec<(PlayerId, Position)> = self
             .players
@@ -845,11 +972,19 @@ impl Game {
                         trail,
                         sprite_id: p.sprite_id,
                         has_crown: crown_holder == Some(p.id),
+                        boost_points: p.boost_points,
+                        boost_active: p.boost_until.map_or(false, |u| std::time::Instant::now() < u),
                     }
                 })
                 .collect();
 
-            self.send_to(*vid, &ServerMsg::Tick(visible));
+            self.send_to(
+                *vid,
+                &ServerMsg::Tick {
+                    players: visible,
+                    board_radius: self.board_radius,
+                },
+            );
             if send_territory {
                 self.send_territory_snapshot(*vid);
             }
@@ -874,7 +1009,7 @@ impl Game {
             .filter(|p| p.alive)
             .filter_map(|p| area_map.get(&p.id).map(|&a| (p, a)))
             .collect();
-        by_area.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        by_area.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.id.cmp(&b.0.id)));
         let by_area: Vec<LeaderboardEntryData> = by_area
             .iter()
             .take(10)
