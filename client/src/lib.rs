@@ -139,6 +139,20 @@ struct GameState {
     #[allow(dead_code)]
     minimap: HtmlCanvasElement,
     minimap_ctx: CanvasRenderingContext2d,
+
+    // --- Performance: throttle direction messages ---
+    last_direction_sent: f64,
+
+    // --- Performance: throttle minimap rendering ---
+    last_minimap_time: f64,
+
+    // --- Performance: cache coordinate string ---
+    last_coord_str: String,
+    last_coord_pos: (f64, f64),
+
+    // --- Performance: cache leaderboard HTML ---
+    last_lb_area_html: String,
+    last_lb_kills_html: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +222,12 @@ pub fn start() {
         board_radius: 50.0,
         minimap,
         minimap_ctx,
+        last_direction_sent: 0.0,
+        last_minimap_time: 0.0,
+        last_coord_str: String::new(),
+        last_coord_pos: (f64::MAX, f64::MAX),
+        last_lb_area_html: String::new(),
+        last_lb_kills_html: String::new(),
     }));
 
     setup_resize(state.clone(), &window);
@@ -649,7 +669,7 @@ fn setup_keyboard(state: Rc<RefCell<GameState>>, window: &Window) {
             };
             if let Some(a) = angle {
                 e.prevent_default();
-                send_angle(&state.borrow(), a);
+                send_angle(&mut state.borrow_mut(), a);
             }
         });
         window
@@ -660,7 +680,7 @@ fn setup_keyboard(state: Rc<RefCell<GameState>>, window: &Window) {
     {
         let cb = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
             if is_movement_key(&e.key()) {
-                send_angle(&state.borrow(), f64::NAN);
+                send_angle(&mut state.borrow_mut(), f64::NAN);
             }
         });
         window
@@ -702,11 +722,11 @@ fn setup_touch(state: Rc<RefCell<GameState>>, window: &Window) {
                 if s.pinch_dist.is_none() {
                     s.touching = true;
                     let a = angle_from_touch(&e, &s);
-                    send_angle(&s, a);
+                    send_angle(&mut s, a);
                 }
             } else if n >= 2 {
                 let mut s = state.borrow_mut();
-                if s.touching { send_angle(&s, f64::NAN); }
+                if s.touching { send_angle(&mut s, f64::NAN); }
                 s.touching = false;
                 if let Some(d) = touch_dist(&e) {
                     s.pinch_dist = Some(d);
@@ -723,10 +743,10 @@ fn setup_touch(state: Rc<RefCell<GameState>>, window: &Window) {
             e.prevent_default();
             let n = e.touches().length();
             if n == 1 {
-                let s = state.borrow();
+                let mut s = state.borrow_mut();
                 if s.touching {
                     let a = angle_from_touch(&e, &s);
-                    send_angle(&s, a);
+                    send_angle(&mut s, a);
                 }
             } else if n >= 2 {
                 if let Some(nd) = touch_dist(&e) {
@@ -747,12 +767,12 @@ fn setup_touch(state: Rc<RefCell<GameState>>, window: &Window) {
             let n = e.touches().length();
             if n == 0 {
                 let mut s = state.borrow_mut();
-                send_angle(&s, f64::NAN);
+                send_angle(&mut s, f64::NAN);
                 s.touching = false;
                 s.pinch_dist = None;
             } else if n == 1 {
                 let mut s = state.borrow_mut();
-                send_angle(&s, f64::NAN);
+                send_angle(&mut s, f64::NAN);
                 s.pinch_dist = None;
                 s.touching = false;
             }
@@ -776,7 +796,7 @@ fn setup_mouse(state: Rc<RefCell<GameState>>, window: &Window) {
             s.mouse_down = true;
             let a = (e.client_y() as f64 - s.height / 2.0)
                 .atan2(e.client_x() as f64 - s.width / 2.0);
-            send_angle(&s, a);
+            send_angle(&mut s, a);
         });
         window.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).unwrap();
         cb.forget();
@@ -784,11 +804,11 @@ fn setup_mouse(state: Rc<RefCell<GameState>>, window: &Window) {
     {
         let state = state.clone();
         let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-            let s = state.borrow();
+            let mut s = state.borrow_mut();
             if s.mouse_down {
                 let a = (e.client_y() as f64 - s.height / 2.0)
                     .atan2(e.client_x() as f64 - s.width / 2.0);
-                send_angle(&s, a);
+                send_angle(&mut s, a);
             }
         });
         window.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref()).unwrap();
@@ -800,7 +820,7 @@ fn setup_mouse(state: Rc<RefCell<GameState>>, window: &Window) {
             if e.button() != 0 { return; }
             let mut s = state.borrow_mut();
             if s.mouse_down {
-                send_angle(&s, f64::NAN);
+                send_angle(&mut s, f64::NAN);
                 s.mouse_down = false;
             }
         });
@@ -828,7 +848,15 @@ fn setup_wheel(state: Rc<RefCell<GameState>>, window: &Window) {
 // Send helpers
 // ---------------------------------------------------------------------------
 
-fn send_angle(s: &GameState, angle: f64) {
+fn send_angle(s: &mut GameState, angle: f64) {
+    // Always send NAN (stop) immediately; throttle direction msgs to 20/sec
+    if !angle.is_nan() {
+        let now = now_ms();
+        if now - s.last_direction_sent < 50.0 {
+            return;
+        }
+        s.last_direction_sent = now;
+    }
     send_angle_raw(&s.ws, angle);
 }
 
@@ -1032,7 +1060,7 @@ fn handle_msg(state: &Rc<RefCell<GameState>>, bytes: &[u8]) {
         }
         ServerMsg::Pong(_) => {}
         ServerMsg::Leaderboard(lb) => {
-            // Update area leaderboard
+            // Update area leaderboard — only touch DOM if content changed
             let mut html = String::from("<b>Top Area</b>\n");
             for (i, e) in lb.by_area.iter().enumerate() {
                 html.push_str(&format!(
@@ -1045,9 +1073,12 @@ fn handle_msg(state: &Rc<RefCell<GameState>>, bytes: &[u8]) {
             if lb.by_area.is_empty() {
                 html.push_str("  ---\n");
             }
-            s.lb_area.set_inner_html(&html);
+            if html != s.last_lb_area_html {
+                s.lb_area.set_inner_html(&html);
+                s.last_lb_area_html = html;
+            }
 
-            // Update kills leaderboard
+            // Update kills leaderboard — only touch DOM if content changed
             let mut html = String::from("<b>Top Kills</b>\n");
             for (i, e) in lb.by_kills.iter().enumerate() {
                 html.push_str(&format!(
@@ -1060,7 +1091,10 @@ fn handle_msg(state: &Rc<RefCell<GameState>>, bytes: &[u8]) {
             if lb.by_kills.is_empty() {
                 html.push_str("  ---\n");
             }
-            s.lb_kills.set_inner_html(&html);
+            if html != s.last_lb_kills_html {
+                s.lb_kills.set_inner_html(&html);
+                s.last_lb_kills_html = html;
+            }
         }
     }
 }
@@ -1190,9 +1224,10 @@ fn render(s: &mut GameState, _ts: f64) {
     // Drop shadow settings
     let shadow_offset = (6.0 * s.zoom).max(2.0);
     let shadow_blur = (1.0 * s.zoom).max(0.5);
+    let shadows_enabled = s.zoom >= 0.25;
 
     // Territory — batch by color, AABB cull, pattern fill with drop shadow
-    ctx.set_shadow_color("rgba(0,0,0,0.55)");
+    ctx.set_shadow_color(if shadows_enabled { "rgba(0,0,0,0.55)" } else { "transparent" });
     ctx.set_shadow_offset_x(shadow_offset);
     ctx.set_shadow_offset_y(shadow_offset);
     ctx.set_shadow_blur(shadow_blur);
@@ -1229,7 +1264,7 @@ fn render(s: &mut GameState, _ts: f64) {
     }
 
     // Trails — with drop shadow
-    ctx.set_shadow_color("rgba(0,0,0,0.5)");
+    ctx.set_shadow_color(if shadows_enabled { "rgba(0,0,0,0.5)" } else { "transparent" });
     ctx.set_shadow_offset_x(shadow_offset * 0.8);
     ctx.set_shadow_offset_y(shadow_offset * 0.8);
     ctx.set_shadow_blur(shadow_blur * 0.8);
@@ -1265,7 +1300,7 @@ fn render(s: &mut GameState, _ts: f64) {
         let sprite_size = r * 8.0;
 
         // Drop shadow for player sprite/circle
-        ctx.set_shadow_color("rgba(0,0,0,0.6)");
+        ctx.set_shadow_color(if shadows_enabled { "rgba(0,0,0,0.6)" } else { "transparent" });
         ctx.set_shadow_offset_x(shadow_offset);
         ctx.set_shadow_offset_y(shadow_offset);
         ctx.set_shadow_blur(shadow_blur);
@@ -1327,19 +1362,29 @@ fn render(s: &mut GameState, _ts: f64) {
         }
     }
 
-    // Coordinates display (bottom center)
+    // Coordinates display (bottom center) — only reformat when position changes noticeably
+    {
+        let (lx, ly) = s.last_coord_pos;
+        if (cam_x - lx).abs() > 0.5 || (cam_y - ly).abs() > 0.5 {
+            s.last_coord_str = format!("{:.0}, {:.0}", cam_x, cam_y);
+            s.last_coord_pos = (cam_x, cam_y);
+        }
+    }
     ctx.set_font("12px monospace");
     ctx.set_fill_style_str("rgba(0,0,0,0.5)");
     ctx.set_text_align("center");
     ctx.set_text_baseline("bottom");
     let _ = ctx.fill_text(
-        &format!("{:.0}, {:.0}", cam_x, cam_y),
+        &s.last_coord_str,
         w / 2.0,
         h - 8.0,
     );
 
-    // Minimap
-    render_minimap(s, cam_x, cam_y, cs);
+    // Minimap — throttle to ~20Hz (50ms intervals)
+    if now - s.last_minimap_time >= 50.0 {
+        s.last_minimap_time = now;
+        render_minimap(s, cam_x, cam_y, cs);
+    }
 }
 
 fn render_minimap(s: &GameState, cam_x: f64, cam_y: f64, cs: f64) {
