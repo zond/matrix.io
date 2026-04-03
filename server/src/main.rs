@@ -786,6 +786,8 @@ impl Game {
         }
 
         // Kill enemies inside the captured area or left stranded
+        // Only kill enemies inside the newly captured area (the trail polygon),
+        // NOT enemies who happen to be anywhere in our existing territory.
         let enemies_to_kill: Vec<PlayerId> = self
             .players
             .values()
@@ -793,7 +795,6 @@ impl Game {
             .filter(|p| {
                 let pt = geo::Point::new(p.position.x, p.position.y);
                 capture_multi.contains(&pt)
-                    || (new_territory.contains(&pt) && !p.territory.contains(&pt))
             })
             .map(|p| p.id)
             .collect();

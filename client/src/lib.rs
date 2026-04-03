@@ -574,24 +574,13 @@ fn get_sprite_image(s: &mut GameState, sprite_id: u32) -> Option<HtmlImageElemen
     }
     let svg = s.sprites.get(sprite_id as usize)?;
     let img = HtmlImageElement::new().ok()?;
-    let data_uri = format!(
-        "data:image/svg+xml;base64,{}",
-        base64_encode(svg.as_bytes())
-    );
+    // Use percent-encoded data URI (handles all UTF-8, unlike btoa which
+    // fails on non-Latin-1 characters in some OpenMoji SVGs).
+    let encoded = js_sys::encode_uri_component(svg);
+    let data_uri = format!("data:image/svg+xml,{}", encoded);
     img.set_src(&data_uri);
     s.sprite_images.insert(sprite_id, img.clone());
     Some(img)
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    let js_str = js_sys::JsString::from(
-        std::str::from_utf8(data).unwrap_or(""),
-    );
-    let encoded = web_sys::window()
-        .unwrap()
-        .btoa(&js_str.as_string().unwrap())
-        .unwrap_or_default();
-    encoded
 }
 
 /// Create a tiled territory pattern: semi-transparent sprite tinted with the player's color.
