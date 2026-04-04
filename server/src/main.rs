@@ -324,7 +324,12 @@ impl Game {
                             other.territory.difference(&spawn_multi)
                         }),
                     ) {
-                        other.territory = diff.simplify(&SIMPLIFY_EPSILON);
+                        let simplified = diff.simplify(&SIMPLIFY_EPSILON);
+                        if simplified.0.is_empty() || simplified.unsigned_area() < 0.01 {
+                            other.territory = diff; // keep unsimplified
+                        } else {
+                            other.territory = simplified;
+                        }
                     }
                 }
 
@@ -552,49 +557,46 @@ impl Game {
                 p.trail.clear();
                 p.trail.push(exit_point);
                 p.update_trail_aabb();
-            } else if !p.in_territory && now_in && p.trail.len() >= 2 {
+            } else if !p.in_territory && now_in {
                 // Returning to territory — find exact crossing point
                 let entry_point = old_pos
                     .and_then(|old| boundary_crossing(old, p.position, &p.territory))
                     .unwrap_or(p.position);
                 p.trail.push(entry_point);
                 p.in_territory = true;
-                p.trail_aabb = None;
-                captures.push(id);
-            } else if !p.in_territory && now_in {
-                p.in_territory = true;
-                p.trail.clear();
-                p.trail_aabb = None;
+                if p.trail.len() >= 3 {
+                    // Enough points for a capture polygon
+                    p.trail_aabb = None;
+                    captures.push(id);
+                } else {
+                    // Too short (exit + entry only, no real trail)
+                    p.trail.clear();
+                    p.trail_aabb = None;
+                }
             }
         }
 
-        // Pre-compute trail LineStrings and AABBs for kill detection
-        let mut trail_lines: HashMap<PlayerId, geo::LineString<f64>> = HashMap::new();
+        // Pre-compute trail AABBs for kill detection (after position updates)
         let mut trail_aabbs: HashMap<PlayerId, (f64, f64, f64, f64)> = HashMap::new();
         for (&pid, p) in &self.players {
             if !p.alive || p.trail.len() < 2 {
                 continue;
             }
-            let mut pts: Vec<geo::Coord<f64>> = Vec::with_capacity(p.trail.len() + 1);
             let mut min_x = f64::MAX;
             let mut min_y = f64::MAX;
             let mut max_x = f64::MIN;
             let mut max_y = f64::MIN;
             for tp in &p.trail {
-                let c = geo::Coord { x: tp.x, y: tp.y };
-                min_x = min_x.min(c.x);
-                min_y = min_y.min(c.y);
-                max_x = max_x.max(c.x);
-                max_y = max_y.max(c.y);
-                pts.push(c);
+                min_x = min_x.min(tp.x);
+                min_y = min_y.min(tp.y);
+                max_x = max_x.max(tp.x);
+                max_y = max_y.max(tp.y);
             }
-            let live = geo::Coord { x: p.position.x, y: p.position.y };
-            min_x = min_x.min(live.x);
-            min_y = min_y.min(live.y);
-            max_x = max_x.max(live.x);
-            max_y = max_y.max(live.y);
-            pts.push(live);
-            trail_lines.insert(pid, geo::LineString::new(pts));
+            // Include live endpoint (current position after movement)
+            min_x = min_x.min(p.position.x);
+            min_y = min_y.min(p.position.y);
+            max_x = max_x.max(p.position.x);
+            max_y = max_y.max(p.position.y);
             trail_aabbs.insert(pid, (min_x, min_y, max_x, max_y));
         }
 
@@ -613,7 +615,7 @@ impl Game {
             if let Some(&old_pos) = old_positions.get(&id) {
                 if !p.in_territory && p.trail.len() >= 3 {
                     let new_pos = p.position;
-                    let check_end = p.trail.len().saturating_sub(2);
+                    let check_end = p.trail.len().saturating_sub(1); // skip only the last point
                     let mut self_killed = false;
                     for i in 0..check_end.saturating_sub(1) {
                         if segments_cross(old_pos, new_pos, p.trail[i], p.trail[i + 1]) {
@@ -623,7 +625,6 @@ impl Game {
                     }
                     if self_killed {
                         kills.push((id, None));
-                        continue;
                     }
                 }
             }
@@ -705,8 +706,20 @@ impl Game {
             }
             let dist = (p.position.x * p.position.x + p.position.y * p.position.y).sqrt();
             if dist > br && dist > 0.0 {
+                let old_x = p.position.x;
+                let old_y = p.position.y;
                 p.position.x = p.position.x / dist * br;
                 p.position.y = p.position.y / dist * br;
+                // If building a trail, keep it consistent with the clamped position
+                if !p.in_territory && !p.trail.is_empty() {
+                    p.update_trail_aabb();
+                    let dx = p.position.x - old_x;
+                    let dy = p.position.y - old_y;
+                    if dx * dx + dy * dy > 0.01 {
+                        p.trail.push(p.position);
+                        p.update_trail_aabb();
+                    }
+                }
             }
         }
     }
@@ -748,7 +761,13 @@ impl Game {
 
         // Union with existing territory
         let new_territory = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            old_territory.union(&capture_multi).simplify(&SIMPLIFY_EPSILON)
+            let union = old_territory.union(&capture_multi);
+            let simplified = union.simplify(&SIMPLIFY_EPSILON);
+            if simplified.0.is_empty() || simplified.unsigned_area() < 0.01 {
+                union // keep unsimplified
+            } else {
+                simplified
+            }
         })) {
             Ok(t) => t,
             Err(_) => {
@@ -764,7 +783,7 @@ impl Game {
                 }
                 geo::MultiPolygon::new(vec![
                     geo::MultiPoint::new(pts).convex_hull(),
-                ])
+                ]).simplify(&SIMPLIFY_EPSILON)
             }
         };
 
@@ -780,7 +799,12 @@ impl Game {
                 if let Ok(diff) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     other.territory.difference(&capture_multi)
                 })) {
-                    other.territory = diff.simplify(&SIMPLIFY_EPSILON);
+                    let simplified = diff.simplify(&SIMPLIFY_EPSILON);
+                    if simplified.0.is_empty() || simplified.unsigned_area() < 0.01 {
+                        other.territory = diff; // keep unsimplified
+                    } else {
+                        other.territory = simplified;
+                    }
                 }
             }
         }
@@ -900,7 +924,7 @@ impl Game {
             if x * x + y * y > max_r * max_r {
                 continue;
             }
-            let spawn = rect_polygon(x - r, y - r, x + r, y + r);
+            let spawn = circle_polygon(x, y, r, 24);
             let clear = self
                 .players
                 .values()
@@ -1144,18 +1168,7 @@ fn circle_polygon(cx: f64, cy: f64, radius: f64, segments: usize) -> geo::Polygo
     geo::Polygon::new(geo::LineString::from(pts), vec![])
 }
 
-fn rect_polygon(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> geo::Polygon<f64> {
-    geo::Polygon::new(
-        geo::LineString::from(vec![
-            (min_x, min_y),
-            (max_x, min_y),
-            (max_x, max_y),
-            (min_x, max_y),
-            (min_x, min_y),
-        ]),
-        vec![],
-    )
-}
+
 
 // ---------------------------------------------------------------------------
 // Capture polygon: trail + boundary walk
@@ -1320,10 +1333,6 @@ fn boundary_crossing(
                 let b1 = Position { x: p.x, y: p.y };
                 let b2 = Position { x: c.x, y: c.y };
                 if let Some((pt, t)) = seg_intersection(from, to, b1, b2) {
-                    // Early exit: intersection very close to `from`
-                    if t < 0.01 {
-                        return Some(pt);
-                    }
                     if best.as_ref().map_or(true, |b| t < b.1) {
                         best = Some((pt, t));
                     }
